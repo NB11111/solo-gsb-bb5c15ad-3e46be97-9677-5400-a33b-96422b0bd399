@@ -1473,3 +1473,214 @@ def test_init_db_migrates_legacy_snapshot_table(tmp_path):
         assert "retain_until" in columns                 # 补列迁移仍生效
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# POST /thread-sla/evaluate：会话响应时限评估（只读）
+# ---------------------------------------------------------------------------
+
+
+def test_thread_sla_statuses_summary_and_preorder(client):
+    # A(08:00) <- B(08:30) <- C(10:30)；阈值 3600 秒
+    client.post("/batches", json={"messages": [
+        _m("A", sent="2026-09-18T08:00:00+00:00"),
+        _m("B", irt="A", refs=["A"], sent="2026-09-18T08:30:00+00:00"),
+        _m("C", irt="B", refs=["A", "B"], sent="2026-09-18T10:30:00+00:00"),
+    ]})
+
+    r = client.post("/thread-sla/evaluate", json={
+        "message_id": "C",   # 锚点可以是会话内任一封
+        "as_of": "2026-09-18T11:00:00+00:00",
+        "threshold_seconds": 3600,
+    })
+    assert r.status_code == 200
+    body = r.json()
+    assert body["message_id"] == "C"
+    assert body["root_id"] == "A"
+    assert body["as_of"] == "2026-09-18T11:00:00Z"
+    assert body["threshold_seconds"] == 3600.0
+    # revision 与 GET /threads 一致（同一整棵会话拓扑）
+    assert body["revision"] == client.get("/threads/C").json()["revision"]
+
+    # 逐封结果按稳定先序排列
+    assert [it["message_id"] for it in body["results"]] == ["A", "B", "C"]
+    a, b, c = body["results"]
+    assert a["depth"] == 0 and b["depth"] == 1 and c["depth"] == 2
+
+    assert a["status"] == "within_sla"          # B 在 30 分钟后响应
+    assert a["response_message_id"] == "B"
+    assert a["response_sent_at"] == "2026-09-18T08:30:00Z"
+    assert a["response_delay_seconds"] == 1800.0
+    assert a["age_seconds"] is None
+
+    assert b["status"] == "late"                # C 在 2 小时后响应，超过阈值
+    assert b["response_message_id"] == "C"
+    assert b["response_delay_seconds"] == 7200.0
+
+    assert c["status"] == "pending"             # 无响应，年龄 30 分钟未超阈值
+    assert c["response_message_id"] is None
+    assert c["response_sent_at"] is None
+    assert c["response_delay_seconds"] is None
+    assert c["age_seconds"] == 1800.0
+
+    assert body["summary"] == {
+        "total": 3, "within_sla": 1, "late": 1, "pending": 1, "overdue": 0,
+    }
+    assert body["chronology_anomalies"] == []
+
+    # as_of 后移使 C 年龄超过阈值 -> overdue
+    again = client.post("/thread-sla/evaluate", json={
+        "message_id": "C",
+        "as_of": "2026-09-18T12:00:00+00:00",
+        "threshold_seconds": 3600,
+    }).json()
+    assert again["results"][2]["status"] == "overdue"
+    assert again["results"][2]["age_seconds"] == 5400.0
+    assert again["summary"]["overdue"] == 1
+
+
+def test_thread_sla_chronology_anomaly_does_not_clear_timeout(client):
+    # B 是 A 的直接子邮件，但 sent_at 早于 A：时序异常，不得作为响应
+    client.post("/batches", json={"messages": [
+        _m("A", sent="2026-09-18T10:00:00+00:00"),
+        _m("B", irt="A", refs=["A"], sent="2026-09-18T09:00:00+00:00"),
+    ]})
+
+    body = client.post("/thread-sla/evaluate", json={
+        "message_id": "A",
+        "as_of": "2026-09-18T12:00:00+00:00",
+        "threshold_seconds": 3600,
+    }).json()
+
+    a, b = body["results"]   # 先序：A(10:00) 在前，B(09:00) 作为子节点在后
+    assert a["message_id"] == "A"
+    assert a["status"] == "overdue"          # 异常子邮件不消除超时
+    assert a["response_message_id"] is None
+    assert a["age_seconds"] == 7200.0
+    assert b["message_id"] == "B"
+    assert b["status"] == "overdue"          # B 自身也无响应且年龄超阈值
+
+    assert body["chronology_anomalies"] == [{
+        "message_id": "B",
+        "parent_id": "A",
+        "sent_at": "2026-09-18T09:00:00Z",
+        "parent_sent_at": "2026-09-18T10:00:00Z",
+    }]
+    assert body["summary"] == {
+        "total": 2, "within_sla": 0, "late": 0, "pending": 0, "overdue": 2,
+    }
+
+
+def test_thread_sla_picks_earliest_valid_response(client):
+    # A 的合格子邮件 B(08:30)、C(08:10) 中取最早的 C；D(07:00) 早于 A 属异常
+    client.post("/batches", json={"messages": [
+        _m("A", sent="2026-09-18T08:00:00+00:00"),
+        _m("B", irt="A", refs=["A"], sent="2026-09-18T08:30:00+00:00"),
+        _m("C", irt="A", refs=["A"], sent="2026-09-18T08:10:00+00:00"),
+        _m("D", irt="A", refs=["A"], sent="2026-09-18T07:00:00+00:00"),
+    ]})
+
+    body = client.post("/thread-sla/evaluate", json={
+        "message_id": "A",
+        "as_of": "2026-09-18T09:00:00+00:00",
+        "threshold_seconds": 900,
+    }).json()
+
+    # 先序：A，然后子节点按 (sent_at, id)：D、C、B
+    assert [it["message_id"] for it in body["results"]] == ["A", "D", "C", "B"]
+    a = body["results"][0]
+    assert a["response_message_id"] == "C"
+    assert a["response_delay_seconds"] == 600.0
+    assert a["status"] == "within_sla"
+    assert [x["message_id"] for x in body["chronology_anomalies"]] == ["D"]
+
+
+def test_thread_sla_threshold_boundary_is_inclusive(client):
+    # 响应耗时 / 年龄恰好等于阈值：within_sla / pending（边界含等于）
+    client.post("/batches", json={"messages": [
+        _m("A", sent="2026-09-18T08:00:00+00:00"),
+        _m("B", irt="A", refs=["A"], sent="2026-09-18T09:00:00+00:00"),
+    ]})
+    body = client.post("/thread-sla/evaluate", json={
+        "message_id": "A",
+        "as_of": "2026-09-18T10:00:00+00:00",
+        "threshold_seconds": 3600,
+    }).json()
+    a, b = body["results"]
+    assert a["response_delay_seconds"] == 3600.0
+    assert a["status"] == "within_sla"
+    assert b["age_seconds"] == 3600.0
+    assert b["status"] == "pending"
+
+
+def test_thread_sla_naive_as_of_treated_as_utc(client):
+    client.post("/batches", json={"messages": [
+        _m("A", sent="2026-09-18T08:00:00+00:00"),
+    ]})
+    body = client.post("/thread-sla/evaluate", json={
+        "message_id": "A",
+        "as_of": "2026-09-18T09:00:00",   # 无时区 -> 按 UTC 处理
+        "threshold_seconds": 3600,
+    }).json()
+    assert body["as_of"] == "2026-09-18T09:00:00Z"
+    assert body["results"][0]["age_seconds"] == 3600.0
+    assert body["results"][0]["status"] == "pending"
+
+
+def test_thread_sla_unknown_message_404(client):
+    r = client.post("/thread-sla/evaluate", json={
+        "message_id": "ghost",
+        "as_of": "2026-09-18T12:00:00+00:00",
+        "threshold_seconds": 60,
+    })
+    assert r.status_code == 404
+
+
+def test_thread_sla_cycle_message_409(client):
+    client.post("/batches", json={"messages": [
+        _m("x", irt="y", refs=["y"]),
+        _m("y", irt="x", refs=["x"]),
+    ]})
+    r = client.post("/thread-sla/evaluate", json={
+        "message_id": "x",
+        "as_of": "2026-09-18T12:00:00+00:00",
+        "threshold_seconds": 60,
+    })
+    assert r.status_code == 409
+
+
+def test_thread_sla_invalid_payload_422(client):
+    assert client.post("/thread-sla/evaluate", json={
+        "message_id": "A",
+        "as_of": "2026-09-18T12:00:00+00:00",
+        "threshold_seconds": -1,          # 阈值不得为负
+    }).status_code == 422
+    assert client.post("/thread-sla/evaluate", json={
+        "message_id": "   ",              # 空白 ID
+        "as_of": "2026-09-18T12:00:00+00:00",
+        "threshold_seconds": 60,
+    }).status_code == 422
+    assert client.post("/thread-sla/evaluate", json={
+        "message_id": "A",                # 缺 as_of / threshold_seconds
+    }).status_code == 422
+
+
+def test_thread_sla_is_read_only(client):
+    batch = client.post("/batches", json={"messages": [
+        _m("A", sent="2026-09-18T08:00:00+00:00"),
+        _m("B", irt="A", refs=["A"], sent="2026-09-18T08:30:00+00:00"),
+    ]}).json()
+    msg_before = client.get("/messages/A").json()
+    thread_before = client.get("/threads/A").json()
+
+    r = client.post("/thread-sla/evaluate", json={
+        "message_id": "A",
+        "as_of": "2026-09-19T00:00:00+00:00",
+        "threshold_seconds": 60,
+    })
+    assert r.status_code == 200
+
+    # 批次快照、邮件、会话树均不被改写
+    assert client.get(f"/batches/{batch['batch_id']}").json() == batch
+    assert client.get("/messages/A").json() == msg_before
+    assert client.get("/threads/A").json() == thread_before

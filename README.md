@@ -4,8 +4,10 @@
 以及可选的保留截止时间 `retain_until`），服务将其归并为**稳定排序的会话树**，
 并给出**重复 ID、缺失引用、引用环**三类诊断。批次请求与归并结果均持久化到 SQLite，
 可随时查询。此外支持**会话活跃冻结 / 解除冻结**、按保留期的**到期批量清理**
-（删除中间节点时自动压缩会话树，支持 `dry_run` 预览），以及**人工会话纠偏**
-（`POST /thread-corrections`，带 revision 乐观校验地调整任一有效邮件的父节点）。
+（删除中间节点时自动压缩会话树，支持 `dry_run` 预览）、**人工会话纠偏**
+（`POST /thread-corrections`，带 revision 乐观校验地调整任一有效邮件的父节点），
+以及**会话响应时限评估**（`POST /thread-sla/evaluate`，只读地逐封判定整棵会话的
+响应是否落在时限内）。
 
 ## 一条命令启动
 
@@ -54,6 +56,7 @@ ports:
 | `GET` | `/messages/{message_id}` | 查询单封邮件及其最终父节点（含 `retain_until` 与 `frozen` 状态） |
 | `GET` | `/threads/{message_id}` | 查询该邮件所属完整会话树与当前拓扑 `revision`；环邮件返回 **409** |
 | `GET` | `/threads/{message_id}/page?limit=&cursor=` | 会话树**游标分页**（先序扁平展开，含 `depth`），适配大型会话 |
+| `POST` | `/thread-sla/evaluate` | **会话响应时限评估**：只读逐封判定整棵会话的响应是否落在 `threshold_seconds` 内 |
 | `POST` | `/retention/freezes` | **活跃冻结**某封有效邮件当前所在的整棵会话（保护范围随会话拓扑自动扩张） |
 | `POST` | `/retention/unfreezes` | **解除**以某封邮件为锚点的冻结 |
 | `POST` | `/retention/cleanups` | **批量清理**截止时间前到期、且未受冻结保护的有效邮件（可 `dry_run`） |
@@ -66,6 +69,7 @@ ports:
 未知 ID：批次 / 邮件查询、`/relinks` 返回 **404**；请求体不合法返回 **422**；
 `/relinks` 若合并候选关系后形成环，整次返回 **409** 且不写库。冻结锚点未知
 返回 **404**，锚点为环内邮件返回 **409**；解除一个不存在的冻结返回 **404**。
+`POST /thread-sla/evaluate` 锚点邮件未知返回 **404**，锚点为环内邮件返回 **409**。
 `POST /thread-corrections` 的错误码见下节（待调整邮件 / 目标父未知 **404**；
 环内邮件、revision 不匹配、自挂/成环均为 **409** 且不写库）。
 
@@ -338,6 +342,61 @@ revision 不匹配时（HTTP **409**，不写库）：
     "message": "expected_revision does not match the current thread topology; no changes were written",
     "current_revision": "d04e…"
   }
+}
+```
+
+### 会话响应时限评估：`POST /thread-sla/evaluate`
+
+以会话内**任意一封有效邮件为锚点**，对其**当前所在的整棵有效会话**逐封判定响应
+是否落在时限内。接口**只读**：不写库、不改写批次快照与诊断明细。
+
+请求体：`message_id`（评估锚点）、`as_of`（评估时刻，无时区按 UTC 处理）、
+`threshold_seconds`（响应时限阈值，秒，不得为负）。逐封判定规则：
+
+- **有效响应**：仅该邮件的**直接子邮件**中、`sent_at` **不早于**父邮件 `sent_at`
+  者可以作为响应；有多封时取**最早**的一封（并列按 `message_id`，与稳定排序一致）。
+  孙邮件及更深的后代不算响应；
+- **时序异常**：`sent_at` 早于父邮件的直接子邮件列入 `chronology_anomalies`，
+  **不得作为响应、不消除超时**；
+- **已有有效响应**：响应耗时 `response_delay_seconds <= threshold_seconds` 标记
+  `within_sla`，否则 `late`（边界含等于）；
+- **无有效响应**：以 `as_of` 计算年龄 `age_seconds = as_of - sent_at`，
+  未超阈值标记 `pending`，超过阈值标记 `overdue`。
+
+响应包含评估基于的当前整棵会话拓扑 `revision`（与 `GET /threads/{message_id}`
+一致）、按**稳定先序**排列的逐封结果 `results`、按状态分类的计数汇总 `summary`，
+以及 `chronology_anomalies`。锚点邮件未知返回 **404**；锚点为环内 `invalid`
+邮件（不属于任何会话）返回 **409**。
+
+```bash
+curl -X POST http://localhost:8000/thread-sla/evaluate \
+  -H 'Content-Type: application/json' \
+  -d '{"message_id": "C", "as_of": "2026-09-18T11:00:00Z", "threshold_seconds": 3600}'
+```
+
+```jsonc
+{
+  "message_id": "C",
+  "root_id": "A",
+  "as_of": "2026-09-18T11:00:00Z",
+  "threshold_seconds": 3600.0,
+  "revision": "9f1a…",                 // 与 GET /threads/C 相同的拓扑摘要
+  "results": [                          // 稳定先序：A -> B -> C
+    {"message_id": "A", "parent_id": null, "depth": 0,
+     "sent_at": "2026-09-18T08:00:00Z", "status": "within_sla",
+     "response_message_id": "B", "response_sent_at": "2026-09-18T08:30:00Z",
+     "response_delay_seconds": 1800.0, "age_seconds": null},
+    {"message_id": "B", "parent_id": "A", "depth": 1,
+     "sent_at": "2026-09-18T08:30:00Z", "status": "late",
+     "response_message_id": "C", "response_sent_at": "2026-09-18T10:30:00Z",
+     "response_delay_seconds": 7200.0, "age_seconds": null},
+    {"message_id": "C", "parent_id": "B", "depth": 2,
+     "sent_at": "2026-09-18T10:30:00Z", "status": "pending",
+     "response_message_id": null, "response_sent_at": null,
+     "response_delay_seconds": null, "age_seconds": 1800.0}
+  ],
+  "summary": {"total": 3, "within_sla": 1, "late": 1, "pending": 1, "overdue": 0},
+  "chronology_anomalies": []            // sent_at 早于父邮件的直接子邮件
 }
 ```
 

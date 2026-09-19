@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Iterable, Optional
 
 
@@ -465,3 +466,141 @@ def plan_retention_cleanup(
         expired_ids=frozenset(expired_valid),
         protected_expired_ids=frozenset(protected_expired),
     )
+
+
+# ---------------------------------------------------------------------------
+# 会话响应时限（SLA）评估：纯逻辑，只读
+# ---------------------------------------------------------------------------
+
+# 逐封判定的四种结论。
+SLA_WITHIN = "within_sla"   # 已有有效响应，且响应耗时不超过阈值
+SLA_LATE = "late"           # 已有有效响应，但响应耗时超过阈值
+SLA_PENDING = "pending"     # 尚无有效响应，以 as_of 计算的年龄未超阈值
+SLA_OVERDUE = "overdue"     # 尚无有效响应，以 as_of 计算的年龄已超阈值
+
+
+@dataclass(frozen=True)
+class SlaItem:
+    """一封邮件的响应时限判定。
+
+    response_* 仅当存在有效响应（最早合格直接子邮件）时非空；
+    age_seconds 仅当无有效响应时非空（以 as_of 计算的年龄）。
+    """
+
+    message_id: str
+    parent_id: Optional[str]
+    sent_at: str
+    depth: int
+    status: str
+    response_message_id: Optional[str]
+    response_sent_at: Optional[str]
+    response_delay_seconds: Optional[float]
+    age_seconds: Optional[float]
+
+
+@dataclass(frozen=True)
+class ChronologyAnomaly:
+    """sent_at 早于父邮件的直接子邮件：时序异常，不得作为响应。"""
+
+    message_id: str
+    parent_id: str
+    sent_at: str
+    parent_sent_at: str
+
+
+@dataclass(frozen=True)
+class ThreadSlaEvaluation:
+    """整棵会话的响应时限评估结论（items 按稳定先序排列）。"""
+
+    items: list[SlaItem]
+    anomalies: list[ChronologyAnomaly]
+    summary: dict[str, int]
+
+
+def _parse_sent_at(iso: str) -> datetime:
+    """把库里的 UTC ISO 8601 字符串解析为 aware datetime（naive 视为 UTC）。"""
+
+    dt = datetime.fromisoformat(iso)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def evaluate_thread_sla(
+    messages: dict[str, ThreadMessage],
+    parent_of: dict[str, Optional[str]],
+    as_of: datetime,
+    threshold_seconds: float,
+) -> ThreadSlaEvaluation:
+    """对整棵会话逐封判定响应时限（纯函数，不改动任何输入）。
+
+    - 有效响应：直接子邮件中 sent_at 不早于该邮件 sent_at 的最早一封
+      （子节点已按 (sent_at, message_id) 稳定排序，首个合格者即最早者）；
+    - sent_at 早于父邮件的直接子邮件记入 anomalies，不得消除超时；
+    - 无有效响应：年龄 = as_of - sent_at，超过阈值 overdue，否则 pending；
+    - 已有有效响应：耗时不超过阈值 within_sla，否则 late（边界含等于）。
+    """
+
+    sent = {mid: _parse_sent_at(m.sent_at) for mid, m in messages.items()}
+    if as_of.tzinfo is None:
+        as_of = as_of.replace(tzinfo=timezone.utc)
+    as_of = as_of.astimezone(timezone.utc)
+
+    roots, children = _sorted_tree(messages, parent_of)
+
+    items: list[SlaItem] = []
+    anomalies: list[ChronologyAnomaly] = []
+    counts = {SLA_WITHIN: 0, SLA_LATE: 0, SLA_PENDING: 0, SLA_OVERDUE: 0}
+
+    def visit(mid: str, depth: int) -> None:
+        parent_sent = sent[mid]
+        response_id: Optional[str] = None
+        for kid in children.get(mid, []):
+            if sent[kid] >= parent_sent:
+                if response_id is None:
+                    response_id = kid  # 首个合格者即最早者
+            else:
+                anomalies.append(ChronologyAnomaly(
+                    message_id=kid,
+                    parent_id=mid,
+                    sent_at=messages[kid].sent_at,
+                    parent_sent_at=messages[mid].sent_at,
+                ))
+
+        if response_id is not None:
+            delay = (sent[response_id] - parent_sent).total_seconds()
+            status = SLA_WITHIN if delay <= threshold_seconds else SLA_LATE
+            items.append(SlaItem(
+                message_id=mid,
+                parent_id=parent_of.get(mid),
+                sent_at=messages[mid].sent_at,
+                depth=depth,
+                status=status,
+                response_message_id=response_id,
+                response_sent_at=messages[response_id].sent_at,
+                response_delay_seconds=delay,
+                age_seconds=None,
+            ))
+        else:
+            age = (as_of - parent_sent).total_seconds()
+            status = SLA_OVERDUE if age > threshold_seconds else SLA_PENDING
+            items.append(SlaItem(
+                message_id=mid,
+                parent_id=parent_of.get(mid),
+                sent_at=messages[mid].sent_at,
+                depth=depth,
+                status=status,
+                response_message_id=None,
+                response_sent_at=None,
+                response_delay_seconds=None,
+                age_seconds=age,
+            ))
+        counts[status] += 1
+        for kid in children.get(mid, []):
+            visit(kid, depth + 1)
+
+    for root in roots:
+        visit(root, 0)
+
+    summary = {"total": len(items), **counts}
+    return ThreadSlaEvaluation(items=items, anomalies=anomalies, summary=summary)

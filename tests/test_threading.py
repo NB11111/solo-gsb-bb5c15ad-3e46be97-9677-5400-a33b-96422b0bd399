@@ -340,3 +340,95 @@ def test_cleanup_expired_foreign_ids_are_ignored():
     assert plan.deleted_ids == ["R"]
     assert plan.expired_ids == frozenset({"R"})
     assert plan.protected_expired_ids == frozenset()
+
+
+# ---------------------------------------------------------------------------
+# evaluate_thread_sla：会话响应时限评估（纯逻辑）
+# ---------------------------------------------------------------------------
+
+from datetime import datetime, timezone  # noqa: E402
+
+from app.threading import evaluate_thread_sla  # noqa: E402
+
+
+def _as_of(iso):
+    return datetime.fromisoformat(iso).replace(tzinfo=timezone.utc)
+
+
+def test_sla_mixed_statuses_and_summary():
+    msgs = {
+        "A": msg("A", sent="2026-09-18T08:00:00+00:00"),
+        "B": msg("B", irt="A", refs=["A"], sent="2026-09-18T08:30:00+00:00"),
+        "C": msg("C", irt="B", refs=["A", "B"], sent="2026-09-18T10:30:00+00:00"),
+    }
+    parent_of = {"A": None, "B": "A", "C": "B"}
+    ev = evaluate_thread_sla(msgs, parent_of, _as_of("2026-09-18T11:00:00+00:00"), 3600)
+
+    assert [i.message_id for i in ev.items] == ["A", "B", "C"]  # 稳定先序
+    a, b, c = ev.items
+    assert (a.status, a.response_message_id, a.response_delay_seconds) == (
+        "within_sla", "B", 1800.0,
+    )
+    assert a.age_seconds is None
+    assert (b.status, b.response_message_id, b.response_delay_seconds) == (
+        "late", "C", 7200.0,
+    )
+    assert (c.status, c.response_message_id, c.age_seconds) == ("pending", None, 1800.0)
+    assert ev.summary == {
+        "total": 3, "within_sla": 1, "late": 1, "pending": 1, "overdue": 0,
+    }
+    assert ev.anomalies == []
+
+
+def test_sla_early_child_is_anomaly_and_not_a_response():
+    msgs = {
+        "A": msg("A", sent="2026-09-18T10:00:00+00:00"),
+        "B": msg("B", irt="A", refs=["A"], sent="2026-09-18T09:00:00+00:00"),
+    }
+    parent_of = {"A": None, "B": "A"}
+    ev = evaluate_thread_sla(msgs, parent_of, _as_of("2026-09-18T12:00:00+00:00"), 3600)
+
+    a = ev.items[0]
+    assert a.message_id == "A"
+    assert a.status == "overdue"          # 异常子邮件不得消除超时
+    assert a.response_message_id is None
+    assert ev.anomalies[0].message_id == "B"
+    assert ev.anomalies[0].parent_id == "A"
+
+
+def test_sla_earliest_valid_child_wins_and_boundary_is_inclusive():
+    msgs = {
+        "A": msg("A", sent="2026-09-18T08:00:00+00:00"),
+        "B": msg("B", irt="A", refs=["A"], sent="2026-09-18T08:30:00+00:00"),
+        "C": msg("C", irt="A", refs=["A"], sent="2026-09-18T08:10:00+00:00"),
+    }
+    parent_of = {"A": None, "B": "A", "C": "A"}
+    ev = evaluate_thread_sla(msgs, parent_of, _as_of("2026-09-18T09:00:00+00:00"), 600)
+
+    a = ev.items[0]
+    assert a.response_message_id == "C"   # 取最早的合格子邮件
+    assert a.response_delay_seconds == 600.0
+    assert a.status == "within_sla"       # 耗时恰好等于阈值仍合格
+    # B/C 无子邮件：年龄超过阈值 -> overdue
+    by_id = {i.message_id: i for i in ev.items}
+    assert by_id["B"].age_seconds == 1800.0 and by_id["B"].status == "overdue"
+    assert by_id["C"].age_seconds == 3000.0 and by_id["C"].status == "overdue"
+
+
+def test_sla_only_direct_children_count_as_responses():
+    # 孙邮件 C 不是 A 的直接子邮件，不能作为 A 的响应
+    msgs = {
+        "A": msg("A", sent="2026-09-18T08:00:00+00:00"),
+        "B": msg("B", irt="A", refs=["A"], sent="2026-09-18T08:05:00+00:00"),
+        "C": msg("C", irt="B", refs=["A", "B"], sent="2026-09-18T08:06:00+00:00"),
+    }
+    parent_of = {"A": None, "B": "A", "C": "B"}
+    ev = evaluate_thread_sla(msgs, parent_of, _as_of("2026-09-18T09:00:00+00:00"), 300)
+
+    by_id = {i.message_id: i for i in ev.items}
+    assert by_id["A"].response_message_id == "B"
+    assert by_id["A"].response_delay_seconds == 300.0
+    assert by_id["A"].status == "within_sla"
+    assert by_id["B"].response_message_id == "C"
+    assert by_id["B"].status == "within_sla"
+    assert by_id["C"].status == "overdue"

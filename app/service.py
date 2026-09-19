@@ -19,6 +19,7 @@ from .schemas import (
     FreezeIn,
     RelinkIn,
     ThreadCorrectionIn,
+    ThreadSlaEvaluateIn,
     UnfreezeIn,
 )
 from .threading import RetentionCleanupPlan, ThreadMessage
@@ -847,6 +848,71 @@ def get_thread_page(
             "items": page,
             "next_cursor": next_cursor,
             "limit": limit,
+        }
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# POST /thread-sla/evaluate：会话响应时限评估（只读）
+# ---------------------------------------------------------------------------
+
+
+def evaluate_thread_sla(payload: ThreadSlaEvaluateIn) -> Optional[dict]:
+    """只读评估某邮件当前所在整棵会话的响应时限。
+
+    未知邮件返回 None（-> 404）；环内 invalid 邮件返回 {"invalid": True}
+    （-> 409）。只读取当前 messages 表：revision 与逐封判定基于同一次
+    装载的整棵会话，不写库、不改写批次快照与诊断明细。
+    """
+
+    as_of = payload.normalized_as_of()
+    conn = database.connect()
+    try:
+        row = conn.execute(
+            "SELECT is_invalid FROM messages WHERE message_id = ?",
+            (payload.message_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        if row["is_invalid"]:
+            return {"invalid": True, "message_id": payload.message_id}
+
+        root_id = _climb_root(conn, payload.message_id)
+        msgs, parents = _load_subtree(conn, root_id)
+        evaluation = threading.evaluate_thread_sla(
+            msgs, parents, as_of, payload.threshold_seconds
+        )
+        return {
+            "message_id": payload.message_id,
+            "root_id": root_id,
+            "as_of": as_of.isoformat(),
+            "threshold_seconds": payload.threshold_seconds,
+            "revision": _tree_revision(msgs, parents),
+            "results": [
+                {
+                    "message_id": item.message_id,
+                    "parent_id": item.parent_id,
+                    "sent_at": item.sent_at,
+                    "depth": item.depth,
+                    "status": item.status,
+                    "response_message_id": item.response_message_id,
+                    "response_sent_at": item.response_sent_at,
+                    "response_delay_seconds": item.response_delay_seconds,
+                    "age_seconds": item.age_seconds,
+                }
+                for item in evaluation.items
+            ],
+            "summary": evaluation.summary,
+            "chronology_anomalies": [
+                {
+                    "message_id": a.message_id,
+                    "parent_id": a.parent_id,
+                    "sent_at": a.sent_at,
+                    "parent_sent_at": a.parent_sent_at,
+                }
+                for a in evaluation.anomalies
+            ],
         }
     finally:
         conn.close()
