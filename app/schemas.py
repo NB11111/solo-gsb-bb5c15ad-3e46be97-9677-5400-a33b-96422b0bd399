@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -218,6 +218,92 @@ class RelinkItem(BaseModel):
 class RelinkResult(BaseModel):
     relinked: int = Field(..., description="实际发生父节点变更的邮件数")
     results: list[RelinkItem] = Field(..., description="按请求顺序逐封给出新旧父/根；未变更者新旧值相同")
+
+
+# ---------------------------------------------------------------------------
+# POST /thread-sla/evaluate：会话响应时限评估
+# ---------------------------------------------------------------------------
+
+
+class ThreadSlaEvaluateIn(BaseModel):
+    """POST /thread-sla/evaluate：评估某邮件当前所在整棵有效会话的响应时限。"""
+
+    message_id: str = Field(
+        ..., min_length=1, description="会话内任一有效邮件 ID（评估其当前所在的整棵会话）"
+    )
+    as_of: datetime = Field(
+        ..., description="评估基准时刻：无有效响应的邮件据此计算年龄；无时区按 UTC 处理"
+    )
+    threshold_seconds: float = Field(
+        ..., ge=0, description="响应时限阈值（秒）；响应耗时 / 年龄 <= 阈值视为达标（边界含等于）"
+    )
+
+    @field_validator("message_id")
+    @classmethod
+    def _strip(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("message_id must not be empty")
+        return v
+
+    def normalized_as_of(self) -> datetime:
+        """as_of 统一换算到 UTC（naive datetime 视为 UTC）。"""
+
+        dt = self.as_of
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+
+
+class ThreadSlaMessageOut(BaseModel):
+    """单封邮件的响应时限判定（按稳定先序排列）。"""
+
+    message_id: str
+    parent_id: Optional[str]
+    sent_at: datetime
+    depth: int
+    status: Literal["within_sla", "late", "pending", "overdue"] = Field(
+        ...,
+        description=(
+            "within_sla/late=已有有效响应（响应耗时是否超阈值）；"
+            "pending/overdue=无有效响应（按 as_of 计算的年龄是否超阈值）"
+        ),
+    )
+    response_message_id: Optional[str] = Field(
+        ..., description="最早的有效响应（sent_at 不早于本邮件的直接子邮件）；无则为 null"
+    )
+    response_seconds: Optional[float] = Field(
+        ..., description="有效响应耗时（秒）；无有效响应为 null"
+    )
+    age_seconds: Optional[float] = Field(
+        ..., description="无有效响应时 as_of - sent_at（秒）；已有有效响应为 null"
+    )
+    chronology_anomalies: list[str] = Field(
+        ...,
+        description="sent_at 早于本邮件的直接子邮件（时序异常，不作为响应、不消除超时）",
+    )
+
+
+class ThreadSlaSummary(BaseModel):
+    within_sla: int
+    late: int
+    pending: int
+    overdue: int
+    total: int
+
+
+class ThreadSlaEvaluateResult(BaseModel):
+    message_id: str = Field(..., description="请求锚点邮件 ID")
+    root_id: str = Field(..., description="评估时刻该邮件当前所在会话的根 ID")
+    revision: str = Field(
+        ..., description="当前整棵会话拓扑 revision（与 GET /threads/{message_id} 一致）"
+    )
+    as_of: datetime = Field(..., description="本次评估实际使用的基准时刻，UTC")
+    threshold_seconds: float
+    results: list[ThreadSlaMessageOut] = Field(
+        ..., description="整棵会话逐封判定，按稳定先序排列"
+    )
+    summary: ThreadSlaSummary = Field(..., description="按状态分类汇总")
 
 
 # ---------------------------------------------------------------------------

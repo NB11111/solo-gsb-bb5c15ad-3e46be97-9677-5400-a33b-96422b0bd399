@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from app.threading import (
     ThreadMessage,
     build_flat_tree,
     build_forest,
+    evaluate_response_sla,
     plan_retention_cleanup,
     resolve_batch,
 )
@@ -340,3 +343,178 @@ def test_cleanup_expired_foreign_ids_are_ignored():
     assert plan.deleted_ids == ["R"]
     assert plan.expired_ids == frozenset({"R"})
     assert plan.protected_expired_ids == frozenset()
+
+
+# ---------------------------------------------------------------------------
+# evaluate_response_sla：会话响应时限评估（纯逻辑）
+# ---------------------------------------------------------------------------
+
+
+def _sla_tree():
+    """R(08:00) -> B(08:30) -> C(09:00)；R -> D(07:00，时序异常子邮件)。"""
+
+    messages = {
+        m.message_id: m
+        for m in [
+            msg("R", sent="2026-09-18T08:00:00+00:00"),
+            msg("B", irt="R", refs=["R"], sent="2026-09-18T08:30:00+00:00"),
+            msg("C", irt="B", refs=["R", "B"], sent="2026-09-18T09:00:00+00:00"),
+            msg("D", irt="R", refs=["R"], sent="2026-09-18T07:00:00+00:00"),
+        ]
+    }
+    parent_of = {"R": None, "B": "R", "C": "B", "D": "R"}
+    return messages, parent_of
+
+
+def _verdict_map(report):
+    return {v.message_id: v for v in report.verdicts}
+
+
+def test_sla_verdicts_follow_stable_preorder_and_summary_counts():
+    messages, parent_of = _sla_tree()
+    report = evaluate_response_sla(
+        messages, parent_of,
+        as_of=datetime(2026, 9, 18, 10, 0, tzinfo=timezone.utc),
+        threshold_seconds=3600,
+    )
+
+    # 子节点按 (sent_at, id) 排序：D(07:00) 先于 B(08:30) -> 先序 R D B C
+    assert [v.message_id for v in report.verdicts] == ["R", "D", "B", "C"]
+    assert [(v.message_id, v.depth) for v in report.verdicts] == [
+        ("R", 0), ("D", 1), ("B", 1), ("C", 2),
+    ]
+    assert report.summary == {
+        "within_sla": 2, "late": 0, "pending": 1, "overdue": 1, "total": 4,
+    }
+
+
+def test_sla_response_must_not_predate_parent_and_earliest_valid_child_wins():
+    messages, parent_of = _sla_tree()
+    report = evaluate_response_sla(
+        messages, parent_of,
+        as_of=datetime(2026, 9, 18, 10, 0, tzinfo=timezone.utc),
+        threshold_seconds=3600,
+    )
+    by_id = _verdict_map(report)
+
+    r = by_id["R"]
+    # D(07:00) 早于 R(08:00)：时序异常，不得作为响应；最早合格响应是 B
+    assert r.status == "within_sla"
+    assert r.response_message_id == "B"
+    assert r.response_seconds == 1800.0
+    assert r.age_seconds is None
+    assert r.chronology_anomalies == ("D",)
+
+    b = by_id["B"]
+    assert b.status == "within_sla"
+    assert b.response_message_id == "C"
+    assert b.response_seconds == 1800.0
+    assert b.chronology_anomalies == ()
+
+    # 无有效响应 -> 以 as_of 计算年龄；age == threshold 边界为 pending
+    c = by_id["C"]
+    assert c.status == "pending"
+    assert c.response_message_id is None
+    assert c.response_seconds is None
+    assert c.age_seconds == 3600.0
+
+    d = by_id["D"]
+    assert d.status == "overdue"
+    assert d.age_seconds == 10800.0
+
+
+def test_sla_anomaly_only_child_does_not_clear_timeout():
+    # 唯一子邮件早于父邮件 -> 父邮件仍按无响应判定
+    messages = {
+        "P": msg("P", sent="2026-09-18T10:00:00+00:00"),
+        "Q": msg("Q", irt="P", refs=["P"], sent="2026-09-18T09:00:00+00:00"),
+    }
+    parent_of = {"P": None, "Q": "P"}
+    report = evaluate_response_sla(
+        messages, parent_of,
+        as_of=datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc),
+        threshold_seconds=3600,
+    )
+    by_id = _verdict_map(report)
+    assert by_id["P"].status == "overdue"  # 年龄 2h > 1h
+    assert by_id["P"].response_message_id is None
+    assert by_id["P"].chronology_anomalies == ("Q",)
+    assert by_id["Q"].status == "overdue"  # Q 自身也无响应，年龄 3h
+    assert report.summary["overdue"] == 2
+
+
+def test_sla_late_when_response_exceeds_threshold():
+    messages, parent_of = _sla_tree()
+    report = evaluate_response_sla(
+        messages, parent_of,
+        as_of=datetime(2026, 9, 18, 10, 0, tzinfo=timezone.utc),
+        threshold_seconds=900,  # 15 分钟：R/B 的响应 30 分钟 -> late
+    )
+    by_id = _verdict_map(report)
+    assert by_id["R"].status == "late"
+    assert by_id["R"].response_seconds == 1800.0
+    assert by_id["B"].status == "late"
+    assert by_id["C"].status == "overdue"  # 年龄 1h > 15min
+    assert report.summary == {
+        "within_sla": 0, "late": 2, "pending": 0, "overdue": 2, "total": 4,
+    }
+
+
+def test_sla_response_exactly_at_threshold_is_within_sla():
+    messages = {
+        "A": msg("A", sent="2026-09-18T08:00:00+00:00"),
+        "B": msg("B", irt="A", refs=["A"], sent="2026-09-18T09:00:00+00:00"),
+    }
+    parent_of = {"A": None, "B": "A"}
+    report = evaluate_response_sla(
+        messages, parent_of,
+        as_of=datetime(2026, 9, 18, 10, 0, tzinfo=timezone.utc),
+        threshold_seconds=3600,  # 响应耗时恰为阈值 -> within_sla（边界含等于）
+    )
+    by_id = _verdict_map(report)
+    assert by_id["A"].status == "within_sla"
+    assert by_id["A"].response_seconds == 3600.0
+    assert by_id["B"].status == "pending"  # 年龄恰为阈值 -> pending
+
+
+def test_sla_earliest_of_multiple_valid_children_wins():
+    messages = {
+        m.message_id: m
+        for m in [
+            msg("R", sent="2026-09-18T08:00:00+00:00"),
+            msg("X", irt="R", refs=["R"], sent="2026-09-18T09:00:00+00:00"),
+            msg("Y", irt="R", refs=["R"], sent="2026-09-18T08:30:00+00:00"),
+        ]
+    }
+    parent_of = {"R": None, "X": "R", "Y": "R"}
+    report = evaluate_response_sla(
+        messages, parent_of,
+        as_of=datetime(2026, 9, 18, 10, 0, tzinfo=timezone.utc),
+        threshold_seconds=3600,
+    )
+    r = _verdict_map(report)["R"]
+    assert r.response_message_id == "Y"  # 最早合格者，而非先看到的 X
+    assert r.response_seconds == 1800.0
+
+
+def test_sla_naive_as_of_is_treated_as_utc():
+    messages = {"A": msg("A", sent="2026-09-18T08:00:00+00:00")}
+    parent_of = {"A": None}
+    report = evaluate_response_sla(
+        messages, parent_of,
+        as_of=datetime(2026, 9, 18, 9, 0),  # naive -> UTC
+        threshold_seconds=3600,
+    )
+    assert report.verdicts[0].status == "pending"
+    assert report.verdicts[0].age_seconds == 3600.0
+
+
+def test_sla_empty_forest_yields_zero_summary():
+    report = evaluate_response_sla(
+        {}, {}, as_of=datetime(2026, 9, 18, tzinfo=timezone.utc),
+        threshold_seconds=60,
+    )
+    assert report.verdicts == []
+    assert report.summary == {
+        "within_sla": 0, "late": 0, "pending": 0, "overdue": 0, "total": 0,
+    }

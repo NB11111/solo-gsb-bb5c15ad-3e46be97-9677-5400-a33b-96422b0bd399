@@ -23,6 +23,8 @@ from .schemas import (
     ThreadCorrectionIn,
     ThreadCorrectionResult,
     ThreadNodeOut,
+    ThreadSlaEvaluateIn,
+    ThreadSlaEvaluateResult,
     UnfreezeIn,
     UnfreezeResult,
 )
@@ -36,11 +38,12 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title=settings.app_title,
-    version="1.3.0",
+    version="1.4.0",
     description=(
         "批量提交邮件头信息，归并为稳定排序的会话树，诊断重复 ID / 缺失引用 / 引用环；"
         "支持邮件保留期（retain_until）、会话活跃冻结/解除冻结与到期批量清理，"
-        "以及人工会话纠偏（POST /thread-corrections）。"
+        "人工会话纠偏（POST /thread-corrections），"
+        "以及会话响应时限评估（POST /thread-sla/evaluate）。"
     ),
     lifespan=lifespan,
 )
@@ -217,6 +220,24 @@ def get_thread_page(
                 "message": "the thread has changed since the cursor was issued; restart from the first page",
             },
         )
+    if result is None:
+        raise HTTPException(status_code=404, detail="message not found")
+    if result.get("invalid"):
+        raise HTTPException(
+            status_code=409,
+            detail="message belongs to a reference cycle and is not attached to any thread",
+        )
+    return result
+
+
+@app.post(
+    "/thread-sla/evaluate",
+    response_model=ThreadSlaEvaluateResult,
+    tags=["threads"],
+    summary="会话响应时限评估：逐封判定 within_sla / late / pending / overdue（只读）",
+)
+def evaluate_thread_sla(payload: ThreadSlaEvaluateIn) -> dict:
+    result = service.evaluate_thread_sla(payload)
     if result is None:
         raise HTTPException(status_code=404, detail="message not found")
     if result.get("invalid"):

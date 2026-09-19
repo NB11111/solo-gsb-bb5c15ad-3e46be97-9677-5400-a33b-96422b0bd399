@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Iterable, Optional
 
 
@@ -464,4 +465,122 @@ def plan_retention_cleanup(
         impacts=impacts,
         expired_ids=frozenset(expired_valid),
         protected_expired_ids=frozenset(protected_expired),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 会话响应时限评估（SLA 纯逻辑，供 POST /thread-sla/evaluate 调用）
+# ---------------------------------------------------------------------------
+
+# 逐封判定的四种结论；分类汇总按此顺序计数。
+SLA_STATUSES = ("within_sla", "late", "pending", "overdue")
+
+
+@dataclass(frozen=True)
+class SlaVerdict:
+    """单封邮件的响应时限判定。"""
+
+    message_id: str
+    parent_id: Optional[str]
+    sent_at: str
+    depth: int
+    status: str                            # SLA_STATUSES 之一
+    response_message_id: Optional[str]     # 最早有效响应；无则 None
+    response_seconds: Optional[float]      # 有效响应耗时；无响应为 None
+    age_seconds: Optional[float]           # 无响应时 as_of - sent_at；有响应为 None
+    chronology_anomalies: tuple[str, ...]  # sent_at 早于本邮件的直接子邮件
+
+
+@dataclass(frozen=True)
+class ThreadSlaReport:
+    """整棵会话的响应时限评估结论；verdicts 按稳定先序排列。"""
+
+    verdicts: list[SlaVerdict]
+    summary: dict[str, int]
+
+
+def _as_utc(dt: datetime) -> datetime:
+    """naive 视为 UTC，aware 换算到 UTC。"""
+
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def evaluate_response_sla(
+    messages: dict[str, ThreadMessage],
+    parent_of: dict[str, Optional[str]],
+    as_of: datetime,
+    threshold_seconds: float,
+) -> ThreadSlaReport:
+    """对整棵有效会话逐封判定响应时限。
+
+    - 每封邮件的“响应”只认 sent_at **不早于**它的直接子邮件，取最早者
+      （子节点已按 (sent_at, message_id) 稳定排序，首个合格者即最早）；
+    - sent_at 早于父邮件的直接子邮件属于时序异常，列入
+      chronology_anomalies，不得作为响应消除超时；
+    - 无有效响应时以 as_of 计算年龄：age <= threshold 为 pending，否则
+      overdue；已有响应时 response <= threshold 为 within_sla，否则 late
+      （边界含等于）。
+    """
+
+    as_of_utc = _as_utc(as_of)
+    roots, children = _sorted_tree(messages, parent_of)
+
+    sent_cache: dict[str, datetime] = {}
+
+    def sent_of(mid: str) -> datetime:
+        dt = sent_cache.get(mid)
+        if dt is None:
+            dt = _as_utc(datetime.fromisoformat(messages[mid].sent_at))
+            sent_cache[mid] = dt
+        return dt
+
+    counts = {status: 0 for status in SLA_STATUSES}
+    verdicts: list[SlaVerdict] = []
+
+    def visit(mid: str, depth: int) -> None:
+        sent = sent_of(mid)
+        response_id: Optional[str] = None
+        response_seconds: Optional[float] = None
+        anomalies: list[str] = []
+        for cid in children.get(mid, []):
+            csent = sent_of(cid)
+            if csent >= sent:
+                if response_id is None:
+                    response_id = cid
+                    response_seconds = (csent - sent).total_seconds()
+            else:
+                anomalies.append(cid)
+
+        if response_id is not None:
+            status = (
+                "within_sla" if response_seconds <= threshold_seconds else "late"
+            )
+            age_seconds = None
+        else:
+            age_seconds = (as_of_utc - sent).total_seconds()
+            status = "pending" if age_seconds <= threshold_seconds else "overdue"
+        counts[status] += 1
+
+        verdicts.append(SlaVerdict(
+            message_id=mid,
+            parent_id=parent_of.get(mid),
+            sent_at=messages[mid].sent_at,
+            depth=depth,
+            status=status,
+            response_message_id=response_id,
+            response_seconds=response_seconds,
+            age_seconds=age_seconds,
+            chronology_anomalies=tuple(anomalies),
+        ))
+        for cid in children.get(mid, []):
+            visit(cid, depth + 1)
+
+    for root in roots:
+        visit(root, 0)
+
+    return ThreadSlaReport(
+        verdicts=verdicts,
+        summary={**counts, "total": len(verdicts)},
     )

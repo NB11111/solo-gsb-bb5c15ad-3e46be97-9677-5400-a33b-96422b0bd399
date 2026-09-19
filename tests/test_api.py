@@ -1473,3 +1473,184 @@ def test_init_db_migrates_legacy_snapshot_table(tmp_path):
         assert "retain_until" in columns                 # 补列迁移仍生效
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# POST /thread-sla/evaluate：会话响应时限评估
+# ---------------------------------------------------------------------------
+
+
+def _seed_sla_thread(client):
+    """R(08:00) -> B(08:30) -> C(09:00)；R -> D(07:00，时序异常子邮件)。"""
+    r = client.post("/batches", json={"messages": [
+        _m("R", sent="2026-09-18T08:00:00+00:00"),
+        _m("B", irt="R", refs=["R"], sent="2026-09-18T08:30:00+00:00"),
+        _m("C", irt="B", refs=["R", "B"], sent="2026-09-18T09:00:00+00:00"),
+        _m("D", irt="R", refs=["R"], sent="2026-09-18T07:00:00+00:00"),
+    ]})
+    assert r.status_code == 201
+    return r.json()
+
+
+def _sla(client, mid, as_of="2026-09-18T10:00:00Z", threshold=3600):
+    return client.post("/thread-sla/evaluate", json={
+        "message_id": mid,
+        "as_of": as_of,
+        "threshold_seconds": threshold,
+    })
+
+
+def test_thread_sla_evaluate_whole_thread_preorder_and_summary(client):
+    _seed_sla_thread(client)
+    r = _sla(client, "C")  # 锚点取深层邮件：仍评估其当前所在整棵会话
+    assert r.status_code == 200
+    body = r.json()
+
+    assert body["message_id"] == "C"
+    assert body["root_id"] == "R"
+    assert body["as_of"] == "2026-09-18T10:00:00Z"
+    assert body["threshold_seconds"] == 3600
+    # revision 与 GET /threads 一致
+    assert body["revision"] == client.get("/threads/C").json()["revision"]
+
+    # 稳定先序：R 的子节点按 (sent_at, id) 排序，D(07:00) 先于 B(08:30)
+    assert [(i["message_id"], i["depth"]) for i in body["results"]] == [
+        ("R", 0), ("D", 1), ("B", 1), ("C", 2),
+    ]
+    by_id = {i["message_id"]: i for i in body["results"]}
+
+    r_v = by_id["R"]
+    assert r_v["parent_id"] is None
+    assert r_v["status"] == "within_sla"
+    assert r_v["response_message_id"] == "B"      # 最早合格响应
+    assert r_v["response_seconds"] == 1800.0
+    assert r_v["age_seconds"] is None
+    assert r_v["chronology_anomalies"] == ["D"]   # D 早于 R，不消除超时
+
+    assert by_id["B"]["status"] == "within_sla"
+    assert by_id["B"]["response_message_id"] == "C"
+    assert by_id["B"]["response_seconds"] == 1800.0
+
+    c_v = by_id["C"]
+    assert c_v["status"] == "pending"             # 年龄恰为阈值（边界含等于）
+    assert c_v["response_message_id"] is None
+    assert c_v["response_seconds"] is None
+    assert c_v["age_seconds"] == 3600.0
+    assert c_v["chronology_anomalies"] == []
+
+    d_v = by_id["D"]
+    assert d_v["status"] == "overdue"
+    assert d_v["age_seconds"] == 10800.0
+
+    assert body["summary"] == {
+        "within_sla": 2, "late": 0, "pending": 1, "overdue": 1, "total": 4,
+    }
+
+
+def test_thread_sla_late_and_overdue_when_threshold_tight(client):
+    _seed_sla_thread(client)
+    body = _sla(client, "R", threshold=900).json()
+    by_id = {i["message_id"]: i for i in body["results"]}
+    assert by_id["R"]["status"] == "late"   # 响应 30min > 15min
+    assert by_id["B"]["status"] == "late"
+    assert by_id["C"]["status"] == "overdue"
+    assert by_id["D"]["status"] == "overdue"
+    assert body["summary"] == {
+        "within_sla": 0, "late": 2, "pending": 0, "overdue": 2, "total": 4,
+    }
+
+
+def test_thread_sla_anomaly_only_child_does_not_clear_timeout(client):
+    # 唯一子邮件早于父邮件：父仍按无响应判定，子邮件列入时序异常
+    client.post("/batches", json={"messages": [
+        _m("P", sent="2026-09-18T10:00:00+00:00"),
+        _m("Q", irt="P", refs=["P"], sent="2026-09-18T09:00:00+00:00"),
+    ]})
+    body = _sla(client, "P", as_of="2026-09-18T12:00:00Z").json()
+    by_id = {i["message_id"]: i for i in body["results"]}
+    assert by_id["P"]["status"] == "overdue"   # 年龄 2h > 1h
+    assert by_id["P"]["response_message_id"] is None
+    assert by_id["P"]["chronology_anomalies"] == ["Q"]
+    assert by_id["Q"]["status"] == "overdue"
+    assert body["summary"]["overdue"] == 2
+
+
+def test_thread_sla_evaluates_current_topology_across_batches(client):
+    # 跨批归并：第二批的 C 挂到首批 B 下后，评估覆盖整棵当前会话
+    client.post("/batches", json={"messages": [
+        _m("R", sent="2026-09-18T08:00:00+00:00"),
+        _m("B", irt="R", refs=["R"], sent="2026-09-18T08:30:00+00:00"),
+    ]})
+    client.post("/batches", json={"messages": [
+        _m("C", irt="B", refs=["R", "B"], sent="2026-09-18T09:00:00+00:00"),
+    ]})
+    body = _sla(client, "R").json()
+    assert [i["message_id"] for i in body["results"]] == ["R", "B", "C"]
+    assert body["revision"] == client.get("/threads/R").json()["revision"]
+    by_id = {i["message_id"]: i for i in body["results"]}
+    assert by_id["R"]["response_message_id"] == "B"
+    assert by_id["B"]["response_message_id"] == "C"
+
+
+def test_thread_sla_is_read_only_and_never_rewrites_batch_snapshot(client):
+    batch = _seed_sla_thread(client)
+    snap_before = client.get(f"/batches/{batch['batch_id']}").json()
+
+    first = _sla(client, "R").json()
+    second = _sla(client, "R").json()
+    assert first == second  # 幂等：重复评估结果一致
+
+    # 批次快照与库内结构均未改写
+    assert client.get(f"/batches/{batch['batch_id']}").json() == snap_before
+    assert client.get("/messages/R").json()["parent_id"] is None
+    assert client.get("/messages/B").json()["parent_id"] == "R"
+
+
+def test_thread_sla_unknown_message_returns_404(client):
+    r = _sla(client, "ghost")
+    assert r.status_code == 404
+    assert r.json()["detail"] == "message not found"
+
+
+def test_thread_sla_cycle_message_returns_409(client):
+    client.post("/batches", json={"messages": [
+        _m("x", irt="y", refs=["y"], sent="2026-09-18T12:00:00+00:00"),
+        _m("y", irt="x", refs=["x"], sent="2026-09-18T13:00:00+00:00"),
+    ]})
+    r = _sla(client, "x")
+    assert r.status_code == 409
+    assert "reference cycle" in r.json()["detail"]
+
+
+def test_thread_sla_request_validation(client):
+    _seed_sla_thread(client)
+    # 空白 message_id / 缺字段 / 负阈值 / 非法时间 一律 422
+    assert client.post("/thread-sla/evaluate", json={
+        "message_id": "  ", "as_of": "2026-09-18T10:00:00Z",
+        "threshold_seconds": 1,
+    }).status_code == 422
+    assert client.post("/thread-sla/evaluate", json={
+        "message_id": "R", "threshold_seconds": 1,
+    }).status_code == 422
+    assert client.post("/thread-sla/evaluate", json={
+        "message_id": "R", "as_of": "2026-09-18T10:00:00Z",
+    }).status_code == 422
+    assert client.post("/thread-sla/evaluate", json={
+        "message_id": "R", "as_of": "2026-09-18T10:00:00Z",
+        "threshold_seconds": -1,
+    }).status_code == 422
+    assert client.post("/thread-sla/evaluate", json={
+        "message_id": "R", "as_of": "not-a-time",
+        "threshold_seconds": 1,
+    }).status_code == 422
+
+
+def test_thread_sla_naive_as_of_normalized_to_utc(client):
+    client.post("/batches", json={"messages": [
+        _m("A", sent="2026-09-18T08:00:00+00:00"),
+    ]})
+    body = _sla(client, "A", as_of="2026-09-18T09:00:00").json()  # naive -> UTC
+    assert body["as_of"] == "2026-09-18T09:00:00Z"
+    item = body["results"][0]
+    assert item["status"] == "pending"
+    assert item["age_seconds"] == 3600.0

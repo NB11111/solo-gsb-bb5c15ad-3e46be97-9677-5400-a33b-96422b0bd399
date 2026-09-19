@@ -19,6 +19,7 @@ from .schemas import (
     FreezeIn,
     RelinkIn,
     ThreadCorrectionIn,
+    ThreadSlaEvaluateIn,
     UnfreezeIn,
 )
 from .threading import RetentionCleanupPlan, ThreadMessage
@@ -847,6 +848,63 @@ def get_thread_page(
             "items": page,
             "next_cursor": next_cursor,
             "limit": limit,
+        }
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# POST /thread-sla/evaluate：会话响应时限评估（只读）
+# ---------------------------------------------------------------------------
+
+
+def evaluate_thread_sla(payload: ThreadSlaEvaluateIn) -> Optional[dict]:
+    """评估某邮件当前所在整棵有效会话的响应时限。
+
+    只读接口：基于当前拓扑实时计算，不写库，批次快照与诊断明细永不改写。
+    未知邮件 -> None（404）；环内 invalid 邮件 -> {"invalid": True}（409）。
+    逐封判定规则见 threading.evaluate_response_sla；返回的 revision 与
+    GET /threads/{message_id} 一致。
+    """
+
+    conn = database.connect()
+    try:
+        row = conn.execute(
+            "SELECT is_invalid FROM messages WHERE message_id = ?",
+            (payload.message_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        if row["is_invalid"]:
+            return {"invalid": True, "message_id": payload.message_id}
+
+        root_id = _climb_root(conn, payload.message_id)
+        msgs, parents = _load_subtree(conn, root_id)
+        as_of = payload.normalized_as_of()
+        report = threading.evaluate_response_sla(
+            msgs, parents, as_of, payload.threshold_seconds
+        )
+        return {
+            "message_id": payload.message_id,
+            "root_id": root_id,
+            "revision": _tree_revision(msgs, parents),
+            "as_of": as_of.isoformat(),
+            "threshold_seconds": payload.threshold_seconds,
+            "results": [
+                {
+                    "message_id": v.message_id,
+                    "parent_id": v.parent_id,
+                    "sent_at": v.sent_at,
+                    "depth": v.depth,
+                    "status": v.status,
+                    "response_message_id": v.response_message_id,
+                    "response_seconds": v.response_seconds,
+                    "age_seconds": v.age_seconds,
+                    "chronology_anomalies": list(v.chronology_anomalies),
+                }
+                for v in report.verdicts
+            ],
+            "summary": report.summary,
         }
     finally:
         conn.close()
